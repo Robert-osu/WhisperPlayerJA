@@ -271,9 +271,17 @@ class TranslationWorker(QObject):
 class WordSpan:
     start: float
     end: float
+
+    # Индексация Python
     char_start: int
     char_len: int
 
+    # Индексация Qt (UTF-16)
+    qt_char_start: int
+    qt_char_len: int
+
+def utf16_length(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
 
 class WaveformWorker(QThread):
     ready = Signal(list)
@@ -1966,16 +1974,28 @@ class WhisperPlayer(QWidget):
 
             self.words = []
             self.word_segment_indices = []
+
             text_parts = []
+
             char_pos = 0
+            qt_char_pos = 0
 
             for start, end, token in ordered_words:
                 self.words.append(
-                    WordSpan(start, end, char_pos, len(token))
+                    WordSpan(
+                        start=start,
+                        end=end,
+                        char_start=char_pos,
+                        char_len=len(token),
+                        qt_char_start=qt_char_pos,
+                        qt_char_len=utf16_length(token)
+                    )
                 )
 
                 text_parts.append(token)
+
                 char_pos += len(token)
+                qt_char_pos += utf16_length(token)
 
                 segment_idx = -1
 
@@ -1984,7 +2004,8 @@ class WhisperPlayer(QWidget):
 
                     candidate = (
                         bisect.bisect_right(
-                            segment_starts, midpoint
+                            segment_starts,
+                            midpoint
                         ) - 1
                     )
 
@@ -2155,9 +2176,11 @@ class WhisperPlayer(QWidget):
             word = self.words[idx]
 
             cursor = self.text.textCursor()
-            cursor.setPosition(word.char_start)
+            
+            cursor.setPosition(word.qt_char_start)
+
             cursor.setPosition(
-                word.char_start + word.char_len,
+                word.qt_char_start + word.qt_char_len,
                 QTextCursor.MoveMode.KeepAnchor
             )
 

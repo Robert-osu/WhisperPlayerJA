@@ -20,3 +20,5 @@ env/
 
 # Temporary files
 *.log
+
+help_git.md
