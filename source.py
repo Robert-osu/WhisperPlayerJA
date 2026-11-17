@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import hashlib
+import threading
 from dataclasses import dataclass
 
 from fugashi import Tagger
@@ -283,45 +284,123 @@ class WordSpan:
 def utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
-class WaveformWorker(QThread):
-    ready = Signal(list)
-    failed = Signal(str)
 
-    def __init__(self, path: str, width: int = 2400):
+class WaveformWorker(QThread):
+    ready = Signal(int, list)
+    failed = Signal(int, str)
+
+    def __init__(self, path: str, generation: int, width: int = 2400):
         super().__init__()
+
         self.path = path
+        self.generation = generation
         self.width = width
 
+        self._cancelled = threading.Event()
+        self._process_lock = threading.Lock()
+        self._process = None
+
+    def cancel(self):
+        """Запрашивает остановку FFmpeg."""
+        self._cancelled.set()
+
+        with self._process_lock:
+            proc = self._process
+
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+
     def run(self):
-        # FFmpeg decodes any supported input to low-rate mono float PCM.
         command = [
             "ffmpeg", "-v", "error", "-i", self.path,
-            "-vn", "-ac", "1", "-ar", "8000", "-f", "f32le", "pipe:1"
+            "-vn", "-ac", "1", "-ar", "8000",
+            "-f", "f32le", "pipe:1"
         ]
+
         try:
-            proc = subprocess.run(command, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, check=True)
+            if self._cancelled.is_set():
+                return
+
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            with self._process_lock:
+                self._process = proc
+
+            # Задача могла быть отменена ещё до запуска FFmpeg.
+            if self._cancelled.is_set():
+                proc.terminate()
+
+            # Ожидаем FFmpeg, периодически проверяя отмену.
+            while True:
+                try:
+                    stdout, stderr = proc.communicate(timeout=0.2)
+                    break
+
+                except subprocess.TimeoutExpired:
+                    if self._cancelled.is_set():
+                        proc.terminate()
+
+                        try:
+                            stdout, stderr = proc.communicate(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            stdout, stderr = proc.communicate()
+
+                        return
+
+            if self._cancelled.is_set():
+                return
+
+            if proc.returncode != 0:
+                message = stderr.decode("utf-8", "replace")[-1200:]
+                raise RuntimeError(
+                    "Не удалось построить waveform:\n" + message
+                )
+
             import array
+
             samples = array.array("f")
-            samples.frombytes(proc.stdout)
+            samples.frombytes(stdout)
+
             if sys.byteorder != "little":
                 samples.byteswap()
+
             if not samples:
                 raise RuntimeError("FFmpeg не вернул аудиоданные.")
+
             block = max(1, math.ceil(len(samples) / self.width))
+
             peaks = []
+
             for i in range(0, len(samples), block):
                 chunk = samples[i:i + block]
                 peak = max((abs(x) for x in chunk), default=0.0)
                 peaks.append(min(1.0, peak))
-            self.ready.emit(peaks)
+
+            if not self._cancelled.is_set():
+                self.ready.emit(self.generation, peaks)
+
         except FileNotFoundError:
-            self.failed.emit("Не найден ffmpeg. Установи его: sudo pacman -S ffmpeg")
-        except subprocess.CalledProcessError as exc:
-            message = exc.stderr.decode("utf-8", "replace")[-1200:]
-            self.failed.emit("Не удалось построить waveform:\n" + message)
+            if not self._cancelled.is_set():
+                self.failed.emit(
+                    self.generation,
+                    "Не найден ffmpeg. Установи его: sudo pacman -S ffmpeg"
+                )
+
         except Exception as exc:
-            self.failed.emit(str(exc))
+            if not self._cancelled.is_set():
+                self.failed.emit(self.generation, str(exc))
+
+        finally:
+            with self._process_lock:
+                self._process = None
 
 
 class WaveformWidget(QWidget):
@@ -1843,11 +1922,11 @@ class WhisperPlayer(QWidget):
         QShortcut(QKeySequence("Space"), self, activated=self.toggle_play)
 
     def open_media(
-        self,
-        checked=False,
-        path=None,
-        restore_position=0
-    ):
+            self,
+            checked=False,
+            path=None,
+            restore_position=0
+        ):
         if path is None:
             path, _ = QFileDialog.getOpenFileName(
                 self,
@@ -1860,29 +1939,62 @@ class WhisperPlayer(QWidget):
         if not path:
             return
 
+        # Инициализация менеджера waveform-задач.
+        if not hasattr(self, "_wave_workers"):
+            self._wave_workers = set()
+
+        if not hasattr(self, "_wave_generation"):
+            self._wave_generation = 0
+
+        # Каждое новое медиа получает свой идентификатор.
+        self._wave_generation += 1
+        generation = self._wave_generation
+
+        # Останавливаем построение предыдущих волн.
+        for worker in list(self._wave_workers):
+            worker.cancel()
+
         self.media_path = path
         self._restore_position_ms = restore_position
 
-        # Сразу сохраняем путь к медиа.
         self.settings.setValue("media_path", path)
         self.settings.sync()
 
         self.player.setSource(QUrl.fromLocalFile(path))
 
         self.wave.set_peaks([])
-
         self.status.setText("Строю звуковую волну…")
 
-        self.wave_worker = WaveformWorker(path)
-        self.wave_worker.ready.connect(self.on_wave_ready)
-        self.wave_worker.failed.connect(self.on_wave_failed)
-        self.wave_worker.start()
+        worker = WaveformWorker(path, generation)
 
-    def on_wave_ready(self, peaks):
+        self.wave_worker = worker
+        self._wave_workers.add(worker)
+
+        worker.ready.connect(self.on_wave_ready)
+        worker.failed.connect(self.on_wave_failed)
+
+        # Убираем завершённый поток из коллекции.
+        worker.finished.connect(
+            lambda w=worker: self._wave_workers.discard(w)
+        )
+        worker.finished.connect(worker.deleteLater)
+
+        worker.start()
+
+    def on_wave_ready(self, generation, peaks):
+        # Игнорируем результаты предыдущих медиа.
+        if generation != self._wave_generation:
+            return
+
         self.wave.set_peaks(peaks)
         self.status.setText("Звуковая волна готова")
 
-    def on_wave_failed(self, message):
+
+    def on_wave_failed(self, generation, message):
+        # Не показываем ошибки от отменённых или устаревших задач.
+        if generation != self._wave_generation:
+            return
+
         self.status.setText("Звуковая волна недоступна")
         QMessageBox.warning(self, "Waveform", message)
 
@@ -2250,9 +2362,23 @@ class WhisperPlayer(QWidget):
 
         self.player.stop()
 
-        if self.wave_worker and self.wave_worker.isRunning():
-            self.wave_worker.quit()
-            self.wave_worker.wait(1500)
+        # Запрещаем обработку результатов waveform.
+        if hasattr(self, "_wave_generation"):
+            self._wave_generation += 1
+
+        workers = list(getattr(self, "_wave_workers", set()))
+
+        # Сначала запрашиваем отмену всех задач.
+        for worker in workers:
+            worker.cancel()
+
+        # Затем ждём завершения.
+        for worker in workers:
+            if not worker.wait(3000):
+                event.ignore()
+                return
+
+        self._wave_workers.clear()
 
         if hasattr(self, "dictionary_thread"):
             self.dictionary_thread.quit()
