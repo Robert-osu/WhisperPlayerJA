@@ -680,7 +680,7 @@ class SegmentTranslationPanel(QFrame):
 
 class DictionaryWorker(QObject):
     ready = Signal(bool, str)
-    resultReady = Signal(int, str, dict)
+    resultReady = Signal(int, int, str, dict)
 
     def __init__(self):
         super().__init__()
@@ -694,13 +694,14 @@ class DictionaryWorker(QObject):
         except Exception as exc:
             self.ready.emit(False, str(exc))
 
-    @Slot(int, str)
-    def lookup(self, index, token):
+    @Slot(int, int, str)
+    def lookup(self, generation, index, token):
         if not self.dictionary:
             return
 
         try:
             info = self.dictionary.lookup(token)
+
         except Exception as exc:
             info = {
                 "translation": f"Ошибка поиска: {exc}",
@@ -710,7 +711,12 @@ class DictionaryWorker(QObject):
                 "example": "—"
             }
 
-        self.resultReady.emit(index, token, info)
+        self.resultReady.emit(
+            generation,
+            index,
+            token,
+            info
+        )
 
 
 class AnimatedPlayButton(QPushButton):
@@ -1086,10 +1092,12 @@ class AnimatedSeekButton(QPushButton):
 
 
 class WhisperPlayer(QWidget):
-    dictionaryLookupRequested = Signal(int, str)
+    dictionaryLookupRequested = Signal(int, int, str)
 
     def __init__(self):
         super().__init__()
+
+        self.document_generation = 0
 
         self.setWindowTitle("WhisperX Player")
         self.resize(1080, 760)
@@ -1258,7 +1266,7 @@ class WhisperPlayer(QWidget):
             'color: #444450;'
             'font-size: 13px;'
             'font-weight: 700;'
-            '">Ctrl</span>'
+            '">Ctrl+Tab</span>'
             '<span style="'
             'color: #777783;'
             'font-size: 10px;'
@@ -1447,8 +1455,16 @@ class WhisperPlayer(QWidget):
 
                 self.update_content_margins(False)
 
-    def on_dictionary_result(self, index, token, info):
-        # Игнорируем устаревшие результаты поиска
+    def on_dictionary_result(
+        self,
+        generation,
+        index,
+        token,
+        info
+    ):
+        if generation != self.document_generation:
+            return
+
         if index != self.current_index:
             return
 
@@ -1883,6 +1899,8 @@ class WhisperPlayer(QWidget):
         if not path:
             return
 
+        self.document_generation += 1
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -2167,7 +2185,9 @@ class WhisperPlayer(QWidget):
 
             if token:
                 self.dictionaryLookupRequested.emit(
-                    idx, token
+                    self.document_generation,
+                    idx,
+                    token
                 )
 
         selections = []
@@ -2176,7 +2196,7 @@ class WhisperPlayer(QWidget):
             word = self.words[idx]
 
             cursor = self.text.textCursor()
-            
+
             cursor.setPosition(word.qt_char_start)
 
             cursor.setPosition(
