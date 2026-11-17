@@ -229,9 +229,9 @@ class TranslationManager:
 
 
 class TranslationWorker(QObject):
-    prepareRequested = Signal(list, str)
-    cacheLoaded = Signal(dict, int)
-    preparationFinished = Signal(str)
+    prepareRequested = Signal(int, list, str)
+    cacheLoaded = Signal(int, dict, int)
+    preparationFinished = Signal(int, str)
 
     def __init__(self):
         super().__init__()
@@ -243,15 +243,19 @@ class TranslationWorker(QObject):
             Qt.ConnectionType.QueuedConnection
         )
 
-    @Slot(list, str)
-    def prepare(self, segments, cache_path):
+    @Slot(int, list, str)
+    def prepare(self, generation, segments, cache_path):
         try:
             cache, missing = self.manager.prepare(
                 segments,
                 cache_path
             )
 
-            self.cacheLoaded.emit(cache, missing)
+            self.cacheLoaded.emit(
+                generation,
+                cache,
+                missing
+            )
 
             if missing:
                 message = (
@@ -261,12 +265,17 @@ class TranslationWorker(QObject):
             else:
                 message = "Все переводы загружены из кэша."
 
-            self.preparationFinished.emit(message)
+            self.preparationFinished.emit(
+                generation,
+                message
+            )
 
         except Exception as exc:
             self.preparationFinished.emit(
+                generation,
                 f"Ошибка загрузки переводов: {exc}"
             )
+
 
 @dataclass
 class WordSpan:
@@ -1252,6 +1261,7 @@ class WhisperPlayer(QWidget):
             self.on_dictionary_result
         )
 
+        
         # Поток подготовки переводов
         self.translation_thread = QThread(self)
         self.translation_worker = TranslationWorker()
@@ -1261,12 +1271,20 @@ class WhisperPlayer(QWidget):
         )
 
         self.translation_worker.cacheLoaded.connect(
-            self.on_translation_cache_loaded
+            self.on_translation_cache_loaded,
+            Qt.ConnectionType.QueuedConnection
         )
 
         self.translation_worker.preparationFinished.connect(
-            self.on_translation_preparation_finished
+            self.on_translation_preparation_finished,
+            Qt.ConnectionType.QueuedConnection
         )
+
+        # Освобождаем worker после завершения потока.
+        self.translation_thread.finished.connect(
+            self.translation_worker.deleteLater
+        )
+
 
         self._connect_signals()
         self._shortcuts()
@@ -1485,14 +1503,25 @@ class WhisperPlayer(QWidget):
                 "Открой аудио и соответствующий JSON WhisperX"
             )
     
-    def on_translation_cache_loaded(self, cache, missing):
+    
+    def on_translation_cache_loaded(self, generation, cache, missing):
+        # Не принимаем результат от предыдущего JSON.
+        if generation != self.document_generation:
+            return
+
         self.segment_translations = cache
 
         # Обновляем панель, если сегмент уже выбран.
         self.update_segment_panel()
 
-    def on_translation_preparation_finished(self, message):
+
+    def on_translation_preparation_finished(self, generation, message):
+        # Не позволяем старой задаче менять статус нового документа.
+        if generation != self.document_generation:
+            return
+
         self.status.setText(message)
+
 
     def update_segment_panel(self):
         if not hasattr(self, "segment_panel"):
@@ -2173,6 +2202,7 @@ class WhisperPlayer(QWidget):
             )
 
             self.translation_worker.prepareRequested.emit(
+                self.document_generation,
                 self.segments,
                 self.translation_cache_path
             )
